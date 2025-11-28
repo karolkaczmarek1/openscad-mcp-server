@@ -78,3 +78,10 @@ Example configuration:
 If the model tries to use generic tools like `write_file` or `edit_file`:
 - The server is designed with aggressive prompts in tool descriptions to force the use of `write_scad_script`.
 - Ensure your client is actually using the tools provided by this server.
+
+## Acknowledgements
+
+- **LLMto3D**: This work is inspired by the research paper *[LLMto3D - Generation of parametric 3D printable objects using large language models](https://www.researchgate.net/publication/392939330_LLMto3D_-_Generation_of_parametric_3D_printable_objects_using_large_language_models)* by Bat El Hizmi et al.
+- **[OpenSCAD](https://openscad.org/)**: The programmers' solid 3D CAD modeller.
+- **[BOSL2](https://github.com/BelfrySCAD/BOSL2)**: The Belfry OpenScad Library v2, an essential library for parametric design.
+- **[Gemini CLI](https://github.com/google-gemini/gemini-cli)**: An open-source AI agent that brings the power of Gemini directly into your terminal.
