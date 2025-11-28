@@ -67,6 +67,13 @@ class OpenSCADRunner:
             return False, "", "OpenSCAD executable not found."
 
         command = [self.executable] + args
+
+        # On Linux, try to use xvfb-run if available to support headless rendering
+        if platform.system() == "Linux":
+            xvfb_path = shutil.which("xvfb-run")
+            if xvfb_path:
+                command = [xvfb_path, "-a"] + command
+
         try:
             result = subprocess.run(
                 command,
