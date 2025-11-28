@@ -1,2 +1,5 @@
 mcp
 python-dotenv
+numpy
+numpy-stl
+Pillow
