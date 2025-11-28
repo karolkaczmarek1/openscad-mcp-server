@@ -2,6 +2,12 @@ from mcp.server.fastmcp import FastMCP, Image
 import os
 import logging
 from openscad_runner import OpenSCADRunner
+from PIL import Image as PILImage, ImageDraw, ImageFont
+from typing import Optional, Tuple
+import tempfile
+import math
+from stl import mesh
+import numpy as np
 
 # Initialize Logging
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +18,75 @@ mcp = FastMCP("OpenSCAD Server")
 
 # Initialize OpenSCAD Runner
 runner = OpenSCADRunner()
+
+def calculate_camera_parameters(scad_filename: str) -> Tuple[float, float, float, float]:
+    """
+    Calculates the center of the model and an optimal camera distance
+    by exporting to STL and analyzing the bounding box.
+    Returns (center_x, center_y, center_z, distance).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+        temp_stl = tmp.name
+
+    try:
+        # Export to STL to get geometry bounds
+        success, stdout, stderr = runner.run(["-o", temp_stl, scad_filename])
+        if not success:
+            logger.error(f"Failed to export STL for calculation: {stderr}")
+            # Fallback to defaults
+            return 0, 0, 0, 500
+
+        # Load mesh
+        try:
+            your_mesh = mesh.Mesh.from_file(temp_stl)
+
+            if your_mesh.points.size == 0:
+                 return 0, 0, 0, 500
+
+            minx = your_mesh.x.min()
+            maxx = your_mesh.x.max()
+            miny = your_mesh.y.min()
+            maxy = your_mesh.y.max()
+            minz = your_mesh.z.min()
+            maxz = your_mesh.z.max()
+
+            cx = (minx + maxx) / 2
+            cy = (miny + maxy) / 2
+            cz = (minz + maxz) / 2
+
+            width = maxx - minx
+            depth = maxy - miny
+            height = maxz - minz
+
+            # Heuristic for distance:
+            # We want the object to fit.
+            # Diagonal is a safe approximation for the bounding sphere diameter.
+            diagonal = math.sqrt(width**2 + depth**2 + height**2)
+
+            # If diagonal is 0 (empty or single point), default to 100
+            if diagonal == 0:
+                dist = 100
+            else:
+                # Multiply by a factor to give some padding.
+                # For orthographic, 'dist' is roughly the visible height?
+                # Actually, in OpenSCAD command line:
+                # "distance=0: Orthographic view, sized to fit" - but we want to specify rotation.
+                # If we provide non-zero distance, it sets the camera distance.
+                # If we use 0, does it auto-fit?
+                # Let's try to return 0 for distance if we want auto-fit, but we need to pass center.
+                # However, the user wants "calculated" distance.
+                # Let's use diagonal * 2 for safety.
+                dist = diagonal * 2.5
+
+            return float(cx), float(cy), float(cz), float(dist)
+
+        except Exception as e:
+            logger.error(f"Error analyzing STL: {e}")
+            return 0, 0, 0, 500
+
+    finally:
+        if os.path.exists(temp_stl):
+            os.remove(temp_stl)
 
 @mcp.tool()
 def write_scad_script(filename: str, content: str) -> str:
@@ -129,13 +204,21 @@ def list_scad_library_directory(dirpath: str) -> str:
         return f"Error reading directory: {str(e)}"
 
 @mcp.tool()
-def render_preview(scad_filename: str, output_filename: str = "preview.png") -> list:
+def render_preview(scad_filename: str, output_filename: str = "preview.png",
+                   rotation_x: Optional[float] = None, rotation_y: Optional[float] = None,
+                   rotation_z: Optional[float] = None, distance: Optional[float] = None) -> list:
     """
     Renders a PNG preview of the OpenSCAD file and returns it visually.
+    Optionally allows specifying rotation and distance.
+    Automatically calculates object center and optimal distance if not provided.
 
     Args:
         scad_filename: The .scad file to render.
         output_filename: The output image filename (default: preview.png).
+        rotation_x: Rotation around X axis (degrees).
+        rotation_y: Rotation around Y axis (degrees).
+        rotation_z: Rotation around Z axis (degrees).
+        distance: Camera distance. If None, it will be calculated automatically.
 
     Returns:
         A list containing the success message/logs and the Image resource.
@@ -146,7 +229,28 @@ def render_preview(scad_filename: str, output_filename: str = "preview.png") -> 
     if not os.path.exists(scad_filename):
         return [f"Error: File {scad_filename} does not exist."]
 
-    success, stdout, stderr = runner.run(["-o", output_filename, scad_filename])
+    args = ["-o", output_filename]
+
+    # Check if we need to set camera manually
+    has_rotation = any(v is not None for v in [rotation_x, rotation_y, rotation_z])
+
+    # We always try to center the object if we are setting any camera parameters
+    # or if the user specifically asked for "preview" which might imply a good view.
+    # But to stay compatible with default behavior (auto-center/auto-dist),
+    # we only force parameters if the user provides rotation or distance.
+    if has_rotation or distance is not None:
+        cx, cy, cz, calc_dist = calculate_camera_parameters(scad_filename)
+
+        rx = rotation_x if rotation_x is not None else 60
+        ry = rotation_y if rotation_y is not None else 0
+        rz = rotation_z if rotation_z is not None else 135
+        d = distance if distance is not None else calc_dist
+
+        args.append(f"--camera={cx},{cy},{cz},{rx},{ry},{rz},{d}")
+
+    args.append(scad_filename)
+
+    success, stdout, stderr = runner.run(args)
 
     result = []
     if success:
@@ -164,6 +268,196 @@ def render_preview(scad_filename: str, output_filename: str = "preview.png") -> 
         return result
     else:
         return [f"Failed to render preview.\nError Output:\n{stderr}"]
+
+@mcp.tool()
+def render_views_matrix(scad_filename: str, output_filename: str = "views_matrix.png", distance: Optional[float] = None) -> list:
+    """
+    Renders a set of views (Top, Bottom, Front, Back, Left, Right, Isometric)
+    and combines them into a single matrix image with labels.
+    Automatically centers the object and calculates distance if not provided.
+
+    Args:
+        scad_filename: The .scad file to render.
+        output_filename: The final combined image filename.
+        distance: Camera distance for all views. If None, calculated automatically.
+
+    Returns:
+        A list containing the success message and the Image resource.
+    """
+    if not runner.executable:
+        return ["Error: OpenSCAD executable not found."]
+
+    if not os.path.exists(scad_filename):
+        return [f"Error: File {scad_filename} does not exist."]
+
+    # Calculate center and distance
+    cx, cy, cz, calc_dist = calculate_camera_parameters(scad_filename)
+    dist = distance if distance is not None else calc_dist
+
+    # Define views: Name -> (rot_x, rot_y, rot_z)
+    views = {
+        # Orthogonal views
+        "Top": (0, 0, 0),
+        "Bottom": (180, 0, 0),
+        "Front": (90, 0, 0),
+        "Back": (90, 0, 180), # 90 around X (Front), then 180 around Z to look from back upright
+        "Left": (90, 0, 270), # 90 around X (Front), then 270 around Z (or -90) to look from Left
+        "Right": (90, 0, 90), # 90 around X (Front), then 90 around Z to look from Right
+
+        # Top Isometrics
+        "Iso TFR": (60, 0, 45),   # Top-Front-Right
+        "Iso TFL": (60, 0, 315),  # Top-Front-Left
+        "Iso TBR": (60, 0, 135),  # Top-Back-Right
+        "Iso TBL": (60, 0, 225),  # Top-Back-Left
+
+        # Bottom Isometries
+        "Iso BFR": (120, 0, 45),  # Bottom-Front-Right
+        "Iso BFL": (120, 0, 315), # Bottom-Front-Left
+        "Iso BBR": (120, 0, 135), # Bottom-Back-Right
+        "Iso BBL": (120, 0, 225)  # Bottom-Back-Left
+    }
+
+    # Map short names to long descriptions for labels
+    labels_map = {
+        "Iso TFR": "Isometric - Top-Front-Right",
+        "Iso TFL": "Isometric - Top-Front-Left",
+        "Iso TBR": "Isometric - Top-Back-Right",
+        "Iso TBL": "Isometric - Top-Back-Left",
+        "Iso BFR": "Isometric - Bottom-Front-Right",
+        "Iso BFL": "Isometric - Bottom-Front-Left",
+        "Iso BBR": "Isometric - Bottom-Back-Right",
+        "Iso BBL": "Isometric - Bottom-Back-Left"
+    }
+
+    generated_images = []
+
+    try:
+        # Create a temporary directory to store individual view images
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name, (rx, ry, rz) in views.items():
+                temp_out = os.path.join(temp_dir, f"{name.replace(' ', '_')}.png")
+
+                # Use calculated center and distance
+                camera_arg = f"--camera={cx},{cy},{cz},{rx},{ry},{rz},{dist}"
+
+                success, stdout, stderr = runner.run(["-o", temp_out, camera_arg, scad_filename])
+
+                if not success:
+                    logger.error(f"Failed to render view {name}: {stderr}")
+                    return [f"Failed to render view {name}.\nError Output:\n{stderr}"]
+
+                try:
+                    # We need to copy or load the image into memory because temp_dir will be deleted
+                    img = PILImage.open(temp_out)
+                    img.load() # Force loading into memory
+                    generated_images.append((name, img, rx, ry, rz))
+                except Exception as e:
+                    return [f"Error processing image for view {name}: {str(e)}"]
+
+            # Create composite image
+            # 14 views total. 4 columns -> 4 rows (16 slots).
+            cols = 4
+            rows = 4 # math.ceil(14 / 4)
+
+            if not generated_images:
+                return ["No images generated."]
+
+            # Assume all images are same size
+            img_w, img_h = generated_images[0][1].size
+
+            # Layout constants
+            label_height = 30
+            padding = 3      # Space between content (image+text) and frame
+            margin = 3       # Space between frame and next cell/edge
+
+            # Content size (Text + Image)
+            content_w = img_w
+            content_h = label_height + img_h
+
+            # Frame size (Content + Padding)
+            frame_w = content_w + 2 * padding
+            frame_h = content_h + 2 * padding
+
+            # Total cell size (Frame + Margin)
+            cell_w = frame_w + margin
+            cell_h = frame_h + margin
+
+            # Matrix image size (add one margin for the left/top edge)
+            matrix_w = cols * cell_w + margin
+            matrix_h = rows * cell_h + margin
+
+            matrix_img = PILImage.new('RGB', (matrix_w, matrix_h), color=(255, 255, 255))
+            draw = ImageDraw.Draw(matrix_img)
+
+            # Load font
+            font_paths = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+            ]
+            font = None
+            for fp in font_paths:
+                if os.path.exists(fp):
+                    try:
+                        font = ImageFont.truetype(fp, 14)
+                        break
+                    except IOError:
+                        continue
+
+            if font is None:
+                font = ImageFont.load_default()
+
+            for idx, (name, img, rx, ry, rz) in enumerate(generated_images):
+                col = idx % cols
+                row = idx // cols
+
+                # Top-left coordinate of the cell (including outer margin)
+                cell_x = margin + col * cell_w
+                cell_y = margin + row * cell_h
+
+                # Draw Frame (Rectangle)
+                # Coordinates: (left, top, right, bottom)
+                # Right and Bottom are inclusive in some APIs, usually x+w-1.
+                # PIL rectangle is [x0, y0, x1, y1] inclusive or exclusive?
+                # PIL rectangle second point is usually exclusive in newer versions, but let's check docs or be safe.
+                # Actually commonly used as (x0, y0, x1, y1).
+                draw.rectangle(
+                    [cell_x, cell_y, cell_x + frame_w - 1, cell_y + frame_h - 1],
+                    outline=(0, 0, 0),
+                    width=1
+                )
+
+                # Paste Image
+                # Inside frame: padding -> Text (label_height) -> Image
+                img_x = cell_x + padding
+                img_y = cell_y + padding + label_height
+                matrix_img.paste(img, (img_x, img_y))
+
+                # Draw Label
+                text_x = cell_x + padding + 5
+                text_y = cell_x + padding + 5 # Typo in original code? No, let's fix.
+                # Actually, text_y should be relative to cell_y
+                text_y = cell_y + padding + 2
+
+                # Use long label if available, otherwise just name
+                display_name = labels_map.get(name, name)
+                label = f"{display_name} (Rot: {rx},{ry},{rz} Dist: {dist:.1f})"
+                draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
+
+            matrix_img.save(output_filename)
+
+            result = []
+            message = f"Successfully generated views matrix: {output_filename}"
+            result.append(message)
+
+            with open(output_filename, "rb") as f:
+                img_data = f.read()
+                result.append(Image(data=img_data, format="png"))
+
+            return result
+
+    except Exception as e:
+        return [f"Error generating matrix: {str(e)}"]
 
 @mcp.tool()
 def export_stl(scad_filename: str, output_filename: str = "model.stl") -> str:
