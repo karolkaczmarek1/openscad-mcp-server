@@ -1,5 +1,4 @@
-mcp
-python-dotenv
-numpy
-numpy-stl
-Pillow
+mcp>=2.3,<3
+python-dotenv>=1.0
+numpy-stl>=3.1
+Pillow>=10.1
